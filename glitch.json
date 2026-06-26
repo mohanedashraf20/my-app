@@ -1,0 +1,7 @@
+{
+  "install": "cd ai_server && npm install",
+  "start": "cd ai_server && node server.js",
+  "watch": {
+    "ignore": ["ai_server/node_modules"]
+  }
+}

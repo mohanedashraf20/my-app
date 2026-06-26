@@ -14,21 +14,22 @@ void main() {
 
 // ─── App Settings & Persistence ──────────────────────────────────────────────
 class AppSettings {
-  static const String _serverUrlKey = "server_url";
+  static const String _groqKeyPref = "groq_api_key";
+  static const String _groqModel = "llama-3.3-70b-versatile";
+  static const String groqEndpoint =
+      "https://api.groq.com/openai/v1/chat/completions";
 
-  /// Default server URL - user can change this from Settings.
-  /// Set this to your hosted server URL (e.g. https://your-app.onrender.com)
-  static const String defaultServerUrl = "https://your-server-url.onrender.com";
-
-  static Future<String> getServerUrl() async {
+  static Future<String> getGroqKey() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_serverUrlKey) ?? defaultServerUrl;
+    return prefs.getString(_groqKeyPref) ?? '';
   }
 
-  static Future<void> setServerUrl(String url) async {
+  static Future<void> setGroqKey(String key) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_serverUrlKey, url.trim().replaceAll(RegExp(r'/$'), ''));
+    await prefs.setString(_groqKeyPref, key.trim());
   }
+
+  static String get model => _groqModel;
 }
 
 // ─── Search Engine ────────────────────────────────────────────────────────────
@@ -687,41 +688,67 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
 
     try {
-      // 1. Get configured server URL
-      final serverUrl = await AppSettings.getServerUrl();
+      // 1. Get Groq API key from settings
+      final groqKey = await AppSettings.getGroqKey();
 
-      if (serverUrl.isEmpty || serverUrl == AppSettings.defaultServerUrl) {
+      if (groqKey.isEmpty) {
         throw Exception(
-          "Server URL is not configured yet.\n"
-          "Please open Settings (⚙️) and enter your hosted server URL."
+          'Groq API key is not set.\n'
+          'Please open Settings (⚙️) and enter your Groq API key.\n\n'
+          'Get a free key from: console.groq.com',
         );
       }
 
-      // 2. POST the user question to the server's /ask endpoint
-      //    The server handles AI calls, PDF search, and returns the reply.
-      final uri = Uri.parse('$serverUrl/ask');
+      // 2. Use local BM25 engine to find relevant bylaws sections (RAG)
+      final searchResults = _engine.search(query, topK: 5);
+      final context = searchResults.isNotEmpty
+          ? searchResults.map((r) => r.text).join('\n\n')
+          : 'No specific bylaws sections found for this query.';
+
+      // 3. Call Groq API directly (no server needed!)
+      const systemPrompt =
+          'You are a helpful academic advisor for FCIT (Faculty of Computing and Information Technology). '
+          'You answer questions about the faculty bylaws and regulations. '
+          'Use the provided context from the official bylaws document to answer accurately. '
+          'If the context does not contain enough information, say so honestly. '
+          'Be concise, clear, and helpful. You can answer in Arabic or English based on the question language.';
+
       final httpResponse = await http
           .post(
-            uri,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'message': query}),
+            Uri.parse(AppSettings.groqEndpoint),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $groqKey',
+            },
+            body: jsonEncode({
+              'model': AppSettings.model,
+              'messages': [
+                {'role': 'system', 'content': systemPrompt},
+                {
+                  'role': 'user',
+                  'content': 'Context from FCIT Bylaws:\n$context\n\nQuestion: $query',
+                },
+              ],
+              'max_tokens': 1024,
+              'temperature': 0.3,
+            }),
           )
           .timeout(
-            const Duration(seconds: 60),
+            const Duration(seconds: 45),
             onTimeout: () => throw Exception(
-              'Request timed out. Make sure your server is running and reachable.',
+              'Request timed out. Please check your internet connection.',
             ),
           );
 
       if (httpResponse.statusCode != 200) {
-        throw Exception(
-          'Server returned an error (HTTP ${httpResponse.statusCode}).\n'
-          'Response: ${httpResponse.body}',
-        );
+        final errorBody = jsonDecode(httpResponse.body);
+        final errorMsg = errorBody['error']?['message'] ?? httpResponse.body;
+        throw Exception('Groq API error: $errorMsg');
       }
 
       final data = jsonDecode(httpResponse.body) as Map<String, dynamic>;
-      final reply = (data['reply'] as String?) ?? 'No reply received from server.';
+      final reply = data['choices']?[0]?['message']?['content'] as String? ??
+          'No reply received.';
 
       setState(() {
         _messages.add(ChatMessage(text: reply, isUser: false, isAi: true));
@@ -1530,28 +1557,34 @@ class _AppSettingsSheetState extends State<AppSettingsSheet> {
   }
 
   Future<void> _loadSettings() async {
-    final url = await AppSettings.getServerUrl();
+    final key = await AppSettings.getGroqKey();
     setState(() {
-      _urlController.text = url;
+      _urlController.text = key;
     });
   }
 
   Future<void> _saveSettings() async {
-    final url = _urlController.text.trim();
-    if (url.isEmpty) {
+    final key = _urlController.text.trim();
+    if (key.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter a valid server URL.'), backgroundColor: Colors.redAccent),
+        const SnackBar(content: Text('Please enter your Groq API key.'), backgroundColor: Colors.redAccent),
+      );
+      return;
+    }
+    if (!key.startsWith('gsk_')) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Invalid key. Groq keys start with "gsk_"'), backgroundColor: Colors.orange),
       );
       return;
     }
     setState(() => _saving = true);
-    await AppSettings.setServerUrl(url);
+    await AppSettings.setGroqKey(key);
     setState(() => _saving = false);
     if (mounted) {
       Navigator.pop(context);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Settings saved successfully!'),
+          content: Text('Groq API key saved! AI Assistant is ready ✅'),
           backgroundColor: Color(0xFF5B4FCF),
         ),
       );
@@ -1602,10 +1635,10 @@ class _AppSettingsSheetState extends State<AppSettingsSheet> {
             // Title row
             Row(
               children: [
-                Icon(Icons.dns_outlined, color: cs.primary),
+                Icon(Icons.vpn_key_rounded, color: cs.primary),
                 const SizedBox(width: 10),
                 Text(
-                  'Server Settings',
+                  'AI Settings',
                   style: TextStyle(
                     fontSize: 20,
                     fontWeight: FontWeight.bold,
@@ -1630,7 +1663,7 @@ class _AppSettingsSheetState extends State<AppSettingsSheet> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'The app sends your questions to your hosted server. The server handles the AI calls securely.',
+                      'The app uses Groq AI directly — no server needed! Get a free API key from console.groq.com',
                       style: TextStyle(
                         fontSize: 12,
                         color: isDark ? Colors.white60 : Colors.black54,
@@ -1641,9 +1674,9 @@ class _AppSettingsSheetState extends State<AppSettingsSheet> {
                 ],
               ),
             ),
-            // Server URL field
+            // Groq API Key field
             Text(
-              'Server URL',
+              'Groq API Key',
               style: TextStyle(
                 fontSize: 14,
                 fontWeight: FontWeight.bold,
@@ -1653,14 +1686,15 @@ class _AppSettingsSheetState extends State<AppSettingsSheet> {
             const SizedBox(height: 8),
             TextField(
               controller: _urlController,
-              keyboardType: TextInputType.url,
+              keyboardType: TextInputType.visiblePassword,
+              obscureText: true,
               style: TextStyle(color: isDark ? Colors.white : Colors.black87),
               decoration: InputDecoration(
                 filled: true,
                 fillColor: isDark ? const Color(0xFF0B0B16) : const Color(0xFFF3F3FA),
-                hintText: 'https://your-app.onrender.com',
+                hintText: 'gsk_xxxxxxxxxxxxxxxxxxxxxxxx',
                 hintStyle: TextStyle(color: isDark ? Colors.white30 : Colors.black38),
-                prefixIcon: Icon(Icons.link_rounded, color: cs.primary),
+                prefixIcon: Icon(Icons.key_rounded, color: cs.primary),
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
                   borderSide: BorderSide.none,
@@ -1672,52 +1706,39 @@ class _AppSettingsSheetState extends State<AppSettingsSheet> {
               ),
             ),
             const SizedBox(height: 24),
-            // Buttons
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton(
-                    onPressed: () => setState(() {
-                      _urlController.text = AppSettings.defaultServerUrl;
-                    }),
-                    style: OutlinedButton.styleFrom(
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      side: BorderSide(color: cs.primary.withValues(alpha: 0.5)),
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                    ),
-                    child: Text('Reset Default', style: TextStyle(color: cs.primary)),
-                  ),
+            // Save button
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: _saving ? null : _saveSettings,
+                style: ElevatedButton.styleFrom(
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  backgroundColor: cs.primary,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: ElevatedButton(
-                    onPressed: _saving ? null : _saveSettings,
-                    style: ElevatedButton.styleFrom(
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      backgroundColor: cs.primary,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                    ),
-                    child: _saving
-                        ? const SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                          )
-                        : const Text('Save Settings'),
-                  ),
-                ),
-              ],
+                child: _saving
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                      )
+                    : const Text('Save API Key'),
+              ),
             ),
             const SizedBox(height: 16),
             Center(
-              child: Text(
-                'Deploy on Render, Railway, or any VPS for free.',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: isDark ? Colors.white38 : Colors.black38,
+              child: GestureDetector(
+                onTap: () {},
+                child: Text(
+                  'Get a FREE Groq key → console.groq.com',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: cs.primary,
+                    decoration: TextDecoration.underline,
+                  ),
+                  textAlign: TextAlign.center,
                 ),
-                textAlign: TextAlign.center,
               ),
             ),
           ],
